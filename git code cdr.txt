@@ -1,0 +1,825 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import pandas as pd
+import os
+import json
+import hashlib
+from tkcalendar import DateEntry
+from functools import lru_cache
+import requests
+from io import StringIO
+import datetime
+import shutil
+import xml.etree.ElementTree as ET
+
+# --- USER/PASSWORD MANAGEMENT (local, hashed, with forgot/change) ---
+USERS_PATH = "users.json"
+
+def hash_pwd(pwd):
+    return hashlib.sha256(pwd.encode()).hexdigest()
+
+def load_users():
+    if not os.path.exists(USERS_PATH):
+        return {}
+    with open(USERS_PATH, "r") as f:
+        return json.load(f)
+
+def save_users(users):
+    with open(USERS_PATH, "w") as f:
+        json.dump(users, f, indent=2)
+
+def ensure_default_user():
+    users = load_users()
+    if "admin" not in users:
+        users["admin"] = hash_pwd("admin")
+        save_users(users)
+
+class LoginDialog(tk.Toplevel):
+    def __init__(self, master, on_success):
+        super().__init__(master)
+        self.title("CDR Analyzer Login")
+        self.on_success = on_success
+        self.geometry("350x270")
+        self.resizable(True, True)
+        self.attributes('-toolwindow', False)
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+        tk.Label(self, text="User Login", font=("Segoe UI", 16, "bold")).pack(pady=8)
+        tk.Label(self, text="User ID", font=("Segoe UI", 12)).pack()
+        self.user = tk.Entry(self, font=("Segoe UI", 13))
+        self.user.pack(pady=3)
+        tk.Label(self, text="Password", font=("Segoe UI", 12)).pack()
+        self.pwd = tk.Entry(self, font=("Segoe UI", 13), show="*")
+        self.pwd.pack(pady=3)
+        tk.Button(self, text="Login", command=self.try_login, font=("Segoe UI", 12, "bold"), width=20, bg="#22a", fg="white").pack(pady=8)
+        tk.Button(self, text="Forgot Password", command=self.forgot_pwd, font=("Segoe UI", 11)).pack()
+        tk.Button(self, text="Change Password", command=self.change_pwd, font=("Segoe UI", 11)).pack()
+        self.err = tk.Label(self, text="", fg="red", font=("Segoe UI", 11))
+        self.err.pack(pady=4)
+
+    def try_login(self):
+        users = load_users()
+        u, p = self.user.get(), self.pwd.get()
+        if u in users and users[u] == hash_pwd(p):
+            self.destroy()
+            self.on_success(u)
+        else:
+            self.err.config(text="Invalid credentials")
+
+    def forgot_pwd(self):
+        users = load_users()
+        user = self.user.get() or simpledialog.askstring("Forgot Password", "Enter your user ID:")
+        if user not in users:
+            messagebox.showerror("Error", "User not found.")
+            return
+        users[user] = hash_pwd("admin")
+        save_users(users)
+        messagebox.showinfo("Password Reset", "Password reset to 'admin'. Please change after login.")
+
+    def change_pwd(self):
+        users = load_users()
+        user = self.user.get()
+        if user not in users:
+            messagebox.showerror("Error", "User not found.")
+            return
+        old = simpledialog.askstring("Change Password", "Enter current password:", show="*")
+        if users[user] != hash_pwd(old):
+            messagebox.showerror("Error", "Wrong password.")
+            return
+        new = simpledialog.askstring("Change Password", "Enter new password:", show="*")
+        users[user] = hash_pwd(new)
+        save_users(users)
+        messagebox.showinfo("Changed", "Password changed!")
+
+    def quit_app(self):
+        self.master.destroy()
+
+# --- CASE MANAGEMENT ---
+CASES_PATH = "cases"
+
+def ensure_cases_folder():
+    if not os.path.exists(CASES_PATH):
+        os.makedirs(CASES_PATH)
+
+def save_case(case_info):
+    ensure_cases_folder()
+    cid = case_info["case_no"]
+    with open(os.path.join(CASES_PATH, f"{cid}.json"), "w") as f:
+        json.dump(case_info, f, indent=2)
+
+def list_cases():
+    ensure_cases_folder()
+    return [f for f in os.listdir(CASES_PATH) if f.endswith(".json")]
+
+def load_case(case_no):
+    path = os.path.join(CASES_PATH, f"{case_no}.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+class CaseDialog(tk.Toplevel):
+    def __init__(self, master, on_case_selected):
+        super().__init__(master)
+        self.title("Case Management")
+        self.geometry("400x430")
+        self.resizable(False, False)
+        self.on_case_selected = on_case_selected
+        self.uploaded_file = None
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True)
+
+        f_add = tk.Frame(nb)
+        nb.add(f_add, text="Add New Case")
+        tk.Label(f_add, text="Case Number:").pack(pady=3)
+        self.e_case_no = tk.Entry(f_add)
+        self.e_case_no.pack(pady=2)
+        tk.Label(f_add, text="Case Name:").pack(pady=3)
+        self.e_case_name = tk.Entry(f_add)
+        self.e_case_name.pack(pady=2)
+        tk.Label(f_add, text="Investigator:").pack(pady=3)
+        self.e_investigator = tk.Entry(f_add)
+        self.e_investigator.pack(pady=2)
+        tk.Label(f_add, text="Case Date:").pack(pady=3)
+        self.e_date = DateEntry(f_add, date_pattern="dd/mm/yyyy")
+        self.e_date.pack(pady=2)
+
+        tk.Label(f_add, text="Attach CDR File:").pack(pady=3)
+        self.cdr_file_label = tk.Label(f_add, text="No file chosen", fg="gray", font=("Segoe UI", 10))
+        self.cdr_file_label.pack(pady=1)
+        tk.Button(f_add, text="Choose File", command=self.choose_file, font=("Segoe UI", 11)).pack(pady=2)
+
+        tk.Button(f_add, text="Save Case", command=self.save_case, bg="#0a8", fg="white", font=("Segoe UI", 11, "bold")).pack(pady=10)
+
+        f_open = tk.Frame(nb)
+        nb.add(f_open, text="Open Existing Case")
+        tk.Label(f_open, text="Select Case:").pack(pady=4)
+        self.case_list = tk.Listbox(f_open, height=10)
+        self.case_list.pack(fill="x", padx=8)
+        self.refresh_cases()
+        tk.Button(f_open, text="Open Selected Case", command=self.open_selected, bg="#22a", fg="white", font=("Segoe UI", 11, "bold")).pack(pady=10)
+
+    def choose_file(self):
+        file_path = filedialog.askopenfilename(
+            title="Select CDR File",
+            filetypes=[("CDR/Excel/CSV Files", "*.csv *.xls *.xlsx *.xml *.json")]
+        )
+        if file_path:
+            self.uploaded_file = file_path
+            self.cdr_file_label.config(text=os.path.basename(file_path))
+
+    def save_case(self):
+        info = {
+            "case_no": self.e_case_no.get(),
+            "case_name": self.e_case_name.get(),
+            "investigator": self.e_investigator.get(),
+            "date": self.e_date.get_date().strftime("%d/%m/%Y"),
+            "cdr_filename": None
+        }
+        if not info["case_no"] or not info["case_name"]:
+            messagebox.showerror("Missing Data", "Case Number and Name are required.")
+            return
+        case_folder = os.path.join(CASES_PATH, info["case_no"])
+        os.makedirs(case_folder, exist_ok=True)
+        cdr_dest = None
+        if self.uploaded_file:
+            cdr_dest = os.path.join(case_folder, os.path.basename(self.uploaded_file))
+            shutil.copy2(self.uploaded_file, cdr_dest)
+            info["cdr_filename"] = os.path.basename(self.uploaded_file)
+        with open(os.path.join(case_folder, "case.json"), "w") as f:
+            json.dump(info, f, indent=2)
+        messagebox.showinfo("Saved", "Case saved.")
+        self.refresh_cases()
+        if cdr_dest:
+            info["cdr_path"] = cdr_dest
+        self.on_case_selected(info)
+        self.destroy()
+
+    def refresh_cases(self):
+        self.case_list.delete(0, "end")
+        for d in os.listdir(CASES_PATH):
+            if os.path.isdir(os.path.join(CASES_PATH, d)):
+                self.case_list.insert("end", d)
+
+    def open_selected(self):
+        idx = self.case_list.curselection()
+        if not idx:
+            return
+        case_no = self.case_list.get(idx[0])
+        case_folder = os.path.join(CASES_PATH, case_no)
+        info_path = os.path.join(case_folder, "case.json")
+        if os.path.exists(info_path):
+            with open(info_path) as f:
+                info = json.load(f)
+                if info.get("cdr_filename"):
+                    info["cdr_path"] = os.path.join(case_folder, info["cdr_filename"])
+            self.on_case_selected(info)
+            self.destroy()
+        else:
+            messagebox.showerror("Error", "Case data not found.")
+
+# --- CDR ANALYTICS CLASS ---
+class CDRAnalyzerApp(tk.Frame):
+    def __init__(self, root, case_info):
+        super().__init__(root, bg="#f4f7fa")
+        self.root = root
+        self.case_info = case_info
+        self.df = None
+        self.filename = None
+        self.tabs = [
+            "Dashboard", "CDR", "Maximum B Party", "Max IMEI", "Max IMSI",
+            "Call Max Location", "Max Day Stay", "Max Night Stay", "SMS Analysis",
+            "Mobile No. Brief", "Report Generation"
+        ]
+        self.tab_frames = {}
+        self.tab_buttons = {}
+        self.a_party = None
+        self.init_ui()
+
+    def init_ui(self):
+        head = tk.Frame(self, bg="#2329ad")
+        head.pack(fill="x")
+        tk.Label(head, text="CDRAnalayz - CDR analysis at ease | CDR Dashboard Analyzer", bg="#2329ad", fg="#fff", font=("Segoe UI", 18, "bold")).pack(side="left", padx=18, pady=6)
+        self.lbl_case = tk.Label(head, text=f"Case: {self.case_info['case_name']} [{self.case_info['case_no']}]", bg="#2329ad", fg="yellow", font=("Segoe UI", 13, "bold"))
+        self.lbl_case.pack(side="left", padx=16)
+        tk.Button(head, text="Add/Load CDR File", command=self.load_file, font=("Segoe UI", 11, "bold"), bg="#1976d2", fg="white").pack(side="right", padx=16, pady=8)
+        self.lbl_file = tk.Label(head, text="", bg="#2329ad", fg="#fff", font=("Segoe UI", 11))
+        self.lbl_file.pack(side="right", padx=6)
+
+        tabbar = tk.Frame(self, bg="#e8eaf6")
+        tabbar.pack(fill="x")
+        for tab in self.tabs:
+            b = tk.Button(tabbar, text=tab, font=("Segoe UI", 12, "bold"), bg="#e8eaf6", relief="flat", command=lambda t=tab: self.activate_tab(t))
+            b.pack(side="left", padx=2, pady=3)
+            self.tab_buttons[tab] = b
+
+        self.content_frame = tk.Frame(self, bg="#f4f7fa")
+        self.content_frame.pack(fill="both", expand=True)
+        self.activate_tab("Dashboard")
+
+    def activate_tab(self, tab):
+        for t, b in self.tab_buttons.items():
+            b.config(bg="#c5cae9" if t == tab else "#e8eaf6")
+        for f in self.tab_frames.values():
+            f.pack_forget()
+        if tab not in self.tab_frames:
+            f = tk.Frame(self.content_frame, bg="#f4f7fa")
+            self.tab_frames[tab] = f
+            self.create_tab_content(tab, f)
+        self.tab_frames[tab].pack(fill="both", expand=True)
+
+    def load_file(self):
+        path = filedialog.askopenfilename(
+            title="Select CDR File",
+            filetypes=[("CSV files", "*.csv"), ("Excel files", "*.xls *.xlsx"), ("XML files", "*.xml"), ("JSON files", "*.json")]
+        )
+        if path:
+            df = self.parse_cdr_file(path)
+            if df is not None:
+                self.df = df
+                self.filename = os.path.basename(path)
+                self.lbl_file.config(text=f"Loaded: {self.filename}")
+                self.a_party = self.detect_a_party()
+                self.tab_frames = {}
+                self.activate_tab("Dashboard")
+
+    def robust_read_csv(self, path):
+        import csv, re
+        possible_seps = [',', '\t', ';', '|', '^', '~']
+        with open(path, 'r', encoding="utf-8", errors="ignore") as f:
+            lines = [line for line in f if line.strip()]
+        header_idx = None
+        sep = None
+        for idx in range(min(30, len(lines))):
+            line = lines[idx]
+            for test_sep in possible_seps:
+                cols = [c.strip() for c in line.strip().split(test_sep)]
+                if len(cols) >= 4 and any(re.search(r'\bparty\b', c.lower()) or re.search(r'date|time|imei|imsi', c.lower()) for c in cols):
+                    header_idx = idx
+                    sep = test_sep
+                    break
+            if header_idx is not None:
+                break
+        if header_idx is None:
+            messagebox.showerror("Could not detect header row or separator in the file. Please check file content.", parent=self)
+            return None
+        data_str = "".join(lines[header_idx:])
+        try:
+            df = pd.read_csv(StringIO(data_str), dtype=str, sep=sep, engine='python', on_bad_lines='skip')
+            df.columns = [c.strip() for c in df.columns]
+            if len(df.columns) < 4:
+                raise Exception("Parsed too few columns")
+            return df
+        except Exception:
+            try:
+                rows = [line.strip().split(sep) for line in lines[header_idx:]]
+                df = pd.DataFrame(rows[1:], columns=rows[0])
+                return df
+            except Exception as e2:
+                messagebox.showerror("Unable to parse CSV, even with fallback.\n" + str(e2), parent=self)
+                return None
+
+    def parse_cdr_file(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".csv":
+            return self.robust_read_csv(path)
+        elif ext in (".xls", ".xlsx"):
+            df = pd.read_excel(path, dtype=str)
+            df.columns = [c.strip() for c in df.columns]
+            return df
+        elif ext == ".json":
+            with open(path, "r", encoding="utf-8") as f:
+                df = pd.DataFrame(json.load(f))
+            df.columns = [c.strip() for c in df.columns]
+            return df
+        elif ext == ".xml":
+            tree = ET.parse(path)
+            root = tree.getroot()
+            data = [child.attrib for child in root]
+            df = pd.DataFrame(data)
+            df.columns = [c.strip() for c in df.columns]
+            return df
+        else:
+            messagebox.showerror("Unsupported file type: " + ext, parent=self)
+            return None
+
+    def detect_a_party(self):
+        if self.df is None:
+            return ""
+        if "Input Value (MSISDN/B PARTY/IMEI/IMSI/CELL ID) :" in self.df.columns:
+            val = self.df["Input Value (MSISDN/B PARTY/IMEI/IMSI/CELL ID) :"].iloc[0]
+            return val.strip().replace("'", "").replace(",", "")
+        for col in self.df.columns:
+            if "called party" in col.lower():
+                return self.df[col].iloc[0].strip().replace("'", "")
+        return ""
+
+    def show_table(self, df, frame, title=None, height=28):
+        if title:
+            tk.Label(frame, text=title, font=("Segoe UI", 15, "bold"), bg="#f4f7fa").pack(pady=4)
+        style = ttk.Style()
+        style.configure("Treeview.Heading", font=("Segoe UI", 12, "bold"))
+        style.configure("Treeview", font=("Segoe UI", 13), rowheight=34)
+        style.map("Treeview", background=[('selected', '#1976d2')])
+        style.layout("Treeview", [('Treeview.treearea', {'sticky': 'nswe'})])
+        cols = list(df.columns)
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=height)
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, width=180, anchor="center")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.pack(side="left", fill="both", expand=True, padx=8, pady=4)
+        vsb.pack(side="left", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        for i, (_, row) in enumerate(df.iterrows()):
+            tags = ("oddrow",) if i % 2 == 0 else ("evenrow",)
+            tree.insert("", "end", values=[row[c] if pd.notna(row[c]) else "" for c in cols], tags=tags)
+        style.configure("Treeview.oddrow", background="#f9f9fc")
+        style.configure("Treeview.evenrow", background="#e6eef8")
+        ttk.Button(frame, text="Export to Excel", command=lambda: self.export_table(df)).pack(pady=6)
+        ttk.Button(frame, text="Export to PDF", command=lambda: self.export_pdf(df, title or "Report")).pack(pady=4)
+
+    def export_table(self, df):
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
+        if path:
+            df.to_excel(path, index=False)
+            messagebox.showinfo("Exported", "Exported successfully.")
+
+    def export_pdf(self, df, title="Report"):
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.units import mm
+        except ImportError:
+            messagebox.showerror("reportlab not installed. Please run: pip install reportlab")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF Files", "*.pdf")])
+        if not path: return
+        c = canvas.Canvas(path, pagesize=A4)
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(30, 800, f"{title}")
+        c.setFont("Helvetica", 12)
+        c.drawString(30, 775, f"Case: {self.case_info['case_name']}  No: {self.case_info['case_no']}")
+        c.drawString(30, 760, f"Investigator: {self.case_info['investigator']}   Date: {self.case_info['date']}")
+        y = 730
+        cols = df.columns.tolist()
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(30, y, " | ".join(cols))
+        c.setFont("Helvetica", 9)
+        y -= 18
+        for i, row in df.iterrows():
+            line = " | ".join(str(row[c]) for c in cols)
+            c.drawString(30, y, line[:120])
+            y -= 14
+            if y < 60:
+                c.showPage()
+                y = 800
+        c.save()
+        messagebox.showinfo("Exported", "PDF exported.")
+
+    def create_tab_content(self, tab, frame):
+        if self.df is None:
+            return
+        if tab == "Dashboard":
+            self.dashboard(frame)
+        elif tab == "CDR":
+            self.show_table(self.df, frame, "Complete CDR Data", height=28)
+        elif tab == "Maximum B Party":
+            self.show_max_b_party(frame)
+        elif tab == "Max IMEI":
+            self.show_max_imei(frame)
+        elif tab == "Max IMSI":
+            self.show_max_imsi(frame)
+        elif tab == "Call Max Location":
+            self.show_call_max_location(frame)
+        elif tab == "Max Day Stay":
+            self.show_max_day_stay(frame)
+        elif tab == "Max Night Stay":
+            self.show_max_night_stay(frame)
+        elif tab == "SMS Analysis":
+            self.show_sms_analysis(frame)
+        elif tab == "Mobile No. Brief":
+            self.show_mobile_brief(frame)
+        elif tab == "Report Generation":
+            self.report_generation(frame)
+
+    def report_generation(self, frame):
+        tk.Label(frame, text="Report Generation", font=("Segoe UI", 16, "bold"), bg="#f4f7fa").pack(pady=10)
+        tk.Button(frame, text="Export to PDF", command=lambda: self.export_pdf(self.df, "Complete CDR Data"), font=("Segoe UI", 12, "bold"), bg="#1976d2", fg="white").pack(pady=10)
+        tk.Button(frame, text="Export to Excel", command=lambda: self.export_table(self.df), font=("Segoe UI", 12, "bold"), bg="#1976d2", fg="white").pack(pady=10)
+
+    def dashboard(self, frame):
+        total_records = len(self.df) if self.df is not None else 0
+        imei_col = self.get_col("IMEI")
+        imsi_col = self.get_col("IMSI")
+        cell_col = self.get_col("First Cell ID")
+        b_col = self.get_col("B Party")
+
+        imeis = self.df[imei_col].dropna().unique() if imei_col and self.df is not None else []
+        imsis = self.df[imsi_col].dropna().unique() if imsi_col and self.df is not None else []
+        cellids = self.df[cell_col].dropna().unique() if cell_col and self.df is not None else []
+        bparties = self.df[b_col].dropna().unique() if b_col and self.df is not None else []
+
+        top_imei = self.df[imei_col].value_counts().idxmax() if imei_col and not self.df[
+            imei_col].empty and self.df is not None else ""
+        clean_imei = str(top_imei).strip().replace("'", "").replace(",", "")
+        if clean_imei.isdigit() and len(clean_imei) >= 8:
+            tac = clean_imei[:8]
+            mkt, brand, model = self.lookup_device_info(tac)
+        else:
+            mkt, brand, model = "Unknown", "Unknown", "Unknown"
+
+        top_cell = self.df[cell_col].value_counts().idxmax() if cell_col and not self.df[
+            cell_col].empty and self.df is not None else ""
+        top_loc = self.lookup_cell_location(top_cell)
+
+        tk.Label(frame, text="CDRAnalayz - CDR analysis at ease", font=("Segoe UI", 16, "bold"), bg="#f4f7fa").pack(
+            pady=10)
+        tk.Label(frame, text="Developed for CID Ranchi", font=("Segoe UI", 14), bg="#f4f7fa").pack(pady=5)
+
+        dash = tk.Frame(frame, bg="#f4f7fa")
+        dash.pack(pady=16)
+
+        def dash_card(master, title, value, color="#1976d2"):
+            c = tk.Frame(master, bg="#fff", relief="groove", bd=2)
+            c.pack(side="left", padx=18)
+            tk.Label(c, text=title, font=("Segoe UI", 13, "bold"), fg=color, bg="#fff").pack(pady=7, padx=30)
+            tk.Label(c, text=str(value), font=("Segoe UI", 16, "bold"), fg="#222", bg="#fff").pack(pady=7)
+
+        dash_card(dash, "Total Records", total_records)
+        dash_card(dash, "Unique IMEIs", len(imeis))
+        dash_card(dash, "Unique IMSIs", len(imsis))
+        dash_card(dash, "Unique Towers", len(cellids))
+        dash_card(dash, "Unique B Party Nos.", len(bparties))
+        dash_card(dash, "Top Device", f"{mkt}\n{brand} {model}")
+        dash_card(dash, "Top Tower Location", top_loc)
+
+        if self.df is not None:
+            tk.Label(frame, text="Sample Data (first 5 rows):", font=("Segoe UI", 14, "bold"), bg="#f4f7fa",
+                     pady=6).pack()
+            self.show_table(self.df.head(5), frame, "", height=5)
+
+    LOOKUP_COLS = {
+        "Target No": ["target no", "target_no", "mobile", "mobile_no", "msisdn", "a_party", "a party", "party a"],
+        "B Party": ["b party", "b_party", "called party", "called_par", "called no", "b_no", "b_number"],
+        "IMEI": ["imei"],
+        "IMSI": ["imsi"],
+        "Duration": ["duration", "call duration", "durati"],
+        "Date": ["date", "call date"],
+        "Time": ["time", "call time"],
+        "First Cell ID": ["first cell id", "first_cell_id", "cell id", "cellid"],
+        "Last Cell ID": ["last cell id", "last_cell_id"],
+        "Call FWD": ["call fwd", "call_fwd"],
+        "LRN": ["lrn"],
+        "Call TT": ["call tt", "call_tt"],
+        "Service Type": ["service type", "service_type"],
+        "Call Type": ["call type", "call_type"],
+        "SMS Center": ["sms center", "sms_center"],
+    }
+
+    def get_col(self, logical_name):
+        logical = logical_name.lower().replace(" ", "_")
+        possible = [logical] + self.LOOKUP_COLS.get(logical_name, [])
+        for col in self.df.columns:
+            norm = col.lower().replace(" ", "_")
+            if norm in possible or any(norm == p for p in possible):
+                return col
+        for col in self.df.columns:
+            norm = col.lower().replace(" ", "_")
+            if any(p in norm for p in possible):
+                return col
+        return None
+
+    def lookup_device_info(self, tac):
+        url = f"https://investigationcamp.com/imei/imei.php?tac={tac}"
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                try:
+                    data = response.json()
+                except json.JSONDecodeError:
+                    print(f"Invalid JSON for TAC {tac}:", response.text)
+                    return "Unknown", "Unknown", "Unknown"
+                return data.get("marketing_name", "Unknown"), data.get("brand", "Unknown"), data.get("model", "Unknown")
+            else:
+                print(f"IMEI API returned {response.status_code} for TAC {tac}")
+                return "Unknown", "Unknown", "Unknown"
+        except Exception as e:
+            print(f"Exception fetching IMEI info for {tac}: {e}")
+            return "Unknown", "Unknown", "Unknown"
+
+    @lru_cache(maxsize=256)
+    def lookup_cell_location(self, cell_id):
+        if not cell_id or cell_id.lower() == "nan":
+            return "Unknown"
+        try:
+            if isinstance(cell_id, float) and pd.isna(cell_id):
+                return "Unknown"
+            location_map = {
+                "001": "New York",
+                "002": "Los Angeles",
+                "003": "Chicago",
+                "004": "Houston",
+                "005": "Phoenix"
+            }
+            return location_map.get(cell_id[-3:], "Unknown")
+        except:
+            return "Unknown"
+
+    def lookup_operator_circle(self, bparty):
+        if str(bparty).startswith("89"): return "VI-HR"
+        if str(bparty).startswith("93"): return "Jio-HR"
+        if str(bparty).startswith("88"): return "Airtel-DL"
+        if str(bparty).startswith("83"): return "Jio-DL"
+        return "Unknown"
+
+    def show_max_b_party(self, frame):
+        b_col = self.get_col("B Party")
+        if not b_col:
+            tk.Label(frame, text="B Party column not found!", fg="red", font=("Segoe UI", 14, "bold"), bg="#f4f7fa").pack()
+            return
+        tgt_col = self.get_col("Target No")
+        dur_col = self.get_col("Duration")
+        date_col = self.get_col("Date")
+        time_col = self.get_col("Time")
+        result = []
+        grouped = self.df.groupby(b_col)
+        for b, group in grouped:
+            target = group[tgt_col].iloc[0] if tgt_col else self.a_party
+            if target == b:
+                continue
+            op = self.lookup_operator_circle(b)
+            calls = len(group)
+            total_secs = 0
+            if dur_col in group:
+                try:
+                    total_secs = group[dur_col].astype(str).apply(lambda x: sum(int(t) * 60 ** i for i, t in enumerate(reversed(x.split(":")))) if ":" in x else int(x) if x.isdigit() else 0).sum()
+                except:
+                    total_secs = 0
+            if date_col and time_col:
+                dt = pd.to_datetime(group[date_col] + " " + group[time_col], errors="coerce", dayfirst=True)
+                first_call = dt.min()
+                last_call = dt.max()
+            else:
+                first_call = last_call = ""
+            result.append([
+                target, b, op, calls, str(pd.to_timedelta(total_secs, unit='s')),
+                first_call if not pd.isnull(first_call) else "",
+                last_call if not pd.isnull(last_call) else ""
+            ])
+        out = pd.DataFrame(sorted(result, key=lambda x: x[3], reverse=True), columns=[
+            "Target No", "B Party", "Operator & Circle", "Max Calls", "Max Call Duration", "First Call", "Last Call"
+        ]).head(30)
+        self.show_table(out, frame, "Maximum B Party Table")
+
+    def show_max_imei(self, frame):
+        imei_col = self.get_col("IMEI")
+        tgt_col = self.get_col("Target No")
+        dur_col = self.get_col("Duration")
+        date_col, time_col = self.get_col("Date"), self.get_col("Time")
+        b_col = self.get_col("B Party")
+        if not imei_col:
+            tk.Label(frame, text="IMEI column not found!", fg="red", font=("Segoe UI", 14, "bold"), bg="#f4f7fa").pack()
+            return
+        result = []
+        for imei, group in self.df.groupby(imei_col):
+            target = group[tgt_col].iloc[0] if tgt_col else self.a_party
+            calls = len(group)
+            tot_secs = 0
+            if dur_col in group:
+                try:
+                    tot_secs = group[dur_col].astype(str).apply(lambda x: sum(
+                        int(t) * 60 ** i for i, t in enumerate(reversed(x.split(":")))) if ":" in x else int(
+                        x) if x.isdigit() else 0).sum()
+                except:
+                    tot_secs = 0
+            if date_col and time_col:
+                dt = pd.to_datetime(group[date_col] + " " + group[time_col], errors="coerce", dayfirst=True)
+                first_call = dt.min()
+                last_call = dt.max()
+                first_b = group.loc[dt.idxmin()][b_col] if b_col and not pd.isnull(dt.min()) else ""
+                last_b = group.loc[dt.idxmax()][b_col] if b_col and not pd.isnull(dt.max()) else ""
+            else:
+                first_call = last_call = first_b = last_b = ""
+            clean_imei = str(imei).strip().replace("'", "").replace(",", "")
+            tac = clean_imei[:8] if len(clean_imei) >= 8 else "00000000"
+            mkt, brand, model = self.lookup_device_info(tac) if imei else ("Unknown", "Unknown", "Unknown")
+            result.append([
+                target, imei, calls, str(pd.to_timedelta(tot_secs, unit='s')),
+                first_call if not pd.isnull(first_call) else "",
+                first_b, last_call if not pd.isnull(last_call) else "", last_b,
+                mkt, brand, model
+            ])
+        out = pd.DataFrame(sorted(result, key=lambda x: x[2], reverse=True), columns=[
+            "Target", "IMEI", "Call Count", "Total Duration", "First Call Date Time", "First Call B Party",
+            "Last Call Date Time", "Last Call B Party", "Marketing Name", "Brand Name", "Model Name"
+        ]).head(30)
+        self.show_table(out, frame, "Max IMEI Table")
+
+    def show_max_imsi(self, frame):
+        imsi_col = self.get_col("IMSI")
+        tgt_col = self.get_col("Target No")
+        date_col, time_col = self.get_col("Date"), self.get_col("Time")
+        if not imsi_col:
+            tk.Label(frame, text="IMSI column not found!", fg="red", font=("Segoe UI", 14, "bold"), bg="#f4f7fa").pack()
+            return
+        result = []
+        for imsi, group in self.df.groupby(imsi_col):
+            target = group[tgt_col].iloc[0] if tgt_col else self.a_party
+            count = len(group)
+            if date_col and time_col:
+                dt = pd.to_datetime(group[date_col] + " " + group[time_col], errors="coerce", dayfirst=True)
+                first = dt.min()
+                last = dt.max()
+            else:
+                first = last = ""
+            result.append([target, imsi, count, first if not pd.isnull(first) else "", last if not pd.isnull(last) else ""])
+        out = pd.DataFrame(sorted(result, key=lambda x: x[2], reverse=True), columns=[
+            "Target", "IMSI", "Count", "First Usage", "Last Usage"
+        ]).head(30)
+        self.show_table(out, frame, "Max IMSI Table")
+
+    def show_call_max_location(self, frame):
+        cell_col = self.get_col("First Cell ID")
+        tgt_col = self.get_col("Target No")
+        dur_col = self.get_col("Duration")
+        b_col = self.get_col("B Party")
+        date_col = self.get_col("Date")
+        time_col = self.get_col("Time")
+        if not cell_col:
+            tk.Label(frame, text="Cell ID column not found!", fg="red", font=("Segoe UI", 14, "bold"), bg="#f4f7fa").pack()
+            return
+        result = []
+        for cell, group in self.df.groupby(cell_col):
+            target = group[tgt_col].iloc[0] if tgt_col else self.a_party
+            loc = self.lookup_cell_location(cell)
+            calls = len(group)
+            total_secs = 0
+            if dur_col in group:
+                try:
+                    total_secs = group[dur_col].astype(str).apply(lambda x: sum(int(t) * 60 ** i for i, t in enumerate(reversed(x.split(":")))) if ":" in x else int(x) if x.isdigit() else 0).sum()
+                except:
+                    total_secs = 0
+            if date_col and time_col:
+                dt = pd.to_datetime(group[date_col] + " " + group[time_col], errors="coerce", dayfirst=True)
+                first_call = dt.min()
+                last_call = dt.max()
+                first_b = group.loc[dt.idxmin()][b_col] if b_col and not pd.isnull(dt.min()) else ""
+                last_b = group.loc[dt.idxmax()][b_col] if b_col and not pd.isnull(dt.max()) else ""
+            else:
+                first_call = last_call = first_b = last_b = ""
+            result.append([target, cell, loc, calls, str(pd.to_timedelta(total_secs, unit='s')), first_call, first_b, last_call, last_b])
+        out = pd.DataFrame(sorted(result, key=lambda x: x[3], reverse=True), columns=[
+            "Target", "Cell ID", "Location", "Call Count", "Duration", "First Call DateTime", "First Call B", "Last Call DateTime", "Last Call B"
+        ]).head(30)
+        self.show_table(out, frame, "Call Max Location Table")
+
+    def show_max_day_stay(self, frame):
+        date_col, time_col = self.get_col("Date"), self.get_col("Time")
+        if not date_col or not time_col:
+            tk.Label(frame, text="Date or Time column not found!", fg="red", font=("Segoe UI", 14, "bold"), bg="#f4f7fa").pack()
+            return
+        dt = pd.to_datetime(self.df[date_col] + " " + self.df[time_col], errors="coerce", dayfirst=True)
+        mask = dt.dt.time >= datetime.time(6, 0, 0)
+        mask &= dt.dt.time <= datetime.time(18, 0, 0)
+        df_day = self.df[mask]
+        self.show_table(df_day, frame, "Max Day Stay (06:00–18:00)", height=16)
+
+    def show_max_night_stay(self, frame):
+        date_col, time_col = self.get_col("Date"), self.get_col("Time")
+        if not date_col or not time_col:
+            tk.Label(frame, text="Date or Time column not found!", fg="red", font=("Segoe UI", 14, "bold"), bg="#f4f7fa").pack()
+            return
+        dt = pd.to_datetime(self.df[date_col] + " " + self.df[time_col], errors="coerce", dayfirst=True)
+        mask = (dt.dt.time < datetime.time(6, 0, 0)) | (dt.dt.time > datetime.time(18, 0, 0))
+        df_night = self.df[mask]
+        self.show_table(df_night, frame, "Max Night Stay (18:01–05:59)", height=16)
+
+    def show_sms_analysis(self, frame):
+        b_col = self.get_col("B Party")
+        if not b_col:
+            tk.Label(frame, text="B Party column (SMS Code) not found!", fg="red", font=("Segoe UI", 14, "bold"), bg="#f4f7fa").pack()
+            return
+        result = {}
+        for code in self.df[b_col]:
+            code = str(code).strip()
+            if not code:
+                continue
+            result[code] = result.get(code, 0) + 1
+        rows = []
+        ENTITY_MAP = {"JioPay": "RELIANCE JIO INFOCOMM LIMITED", "KOTAKB": "Kotak Mahindra Bank Ltd"}
+        PURPOSE_MAP = {"JioPay": "Transactional/Service", "KOTAKB": "Transactional/Service"}
+        for code, count in sorted(result.items(), key=lambda x: x[1], reverse=True):
+            entity = ENTITY_MAP.get(code, "Unknown")
+            purpose = PURPOSE_MAP.get(code, "Unknown")
+            rows.append([code, count, entity, purpose])
+        out = pd.DataFrame(rows, columns=["SMS Code", "Count", "Entity Name", "Purpose"])
+        self.show_table(out, frame, "SMS Analysis Table")
+
+    def show_mobile_brief(self, frame):
+        tgt_col = self.get_col("Target No")
+        imei_col = self.get_col("IMEI")
+        b_col = self.get_col("B Party")
+        cell_col = self.get_col("First Cell ID")
+
+        if not tgt_col:
+            tk.Label(frame, text="Target No column not found!", fg="red", font=("Segoe UI", 14, "bold"),
+                     bg="#f4f7fa").pack()
+            return
+
+        top_imei = self.df[imei_col].value_counts().idxmax() if imei_col and not self.df[imei_col].empty else ""
+        top_b_party = self.df[b_col].value_counts().idxmax() if b_col and not self.df[b_col].empty else ""
+        top_cell_id = self.df[cell_col].value_counts().idxmax() if cell_col and not self.df[cell_col].empty else ""
+
+        clean_imei = str(top_imei).strip().replace("'", "").replace(",", "")
+        if clean_imei.isdigit() and len(clean_imei) >= 8:
+            tac = clean_imei[:8]
+            mkt, brand, model = self.lookup_device_info(tac)
+        else:
+            mkt, brand, model = "Unknown", "Unknown", "Unknown"
+
+        data = {
+            "SNO": [1],
+            "Mobile No": [self.a_party],
+            "CAF": [""],
+            "IMEI": [f"{top_imei} ({mkt}, {brand}, {model})"],
+            "B Party": [top_b_party],
+            "Call Max Location": [top_cell_id],
+            "REFERENCE": [""]
+        }
+        out = pd.DataFrame(data)
+        self.show_table(out, frame, "Mobile No. Brief Table")
+
+
+class MainApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.withdraw()
+        ensure_default_user()
+        self.login_screen()
+
+    def login_screen(self):
+        LoginDialog(self, self.launch_case_mgmt)
+
+    def launch_case_mgmt(self, user_id):
+        self.user_id = user_id
+        CaseDialog(self, self.launch_cdr_analyzer)
+
+    def launch_cdr_analyzer(self, case_info):
+        self.case_info = case_info
+        self.deiconify()
+        self.geometry("1600x900")
+        self.title(f"CDR Analyzer - {case_info['case_name']} [{case_info['case_no']}]")
+        for w in self.winfo_children():
+            w.destroy()
+        CDRAnalyzerApp(self, case_info).pack(fill="both", expand=True)
+
+if __name__ == "__main__":
+    try:
+        from tkcalendar import DateEntry
+    except ImportError:
+        messagebox.showerror("tkcalendar missing", "Run: pip install tkcalendar")
+        exit(1)
+    MainApp().mainloop()
