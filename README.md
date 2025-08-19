@@ -12,7 +12,8 @@ Features suspect detection, geolocation mapping, timeline visualization, and aut
 - Export reports in PDF format
 
 ## 🔹 Installation
-Download the latest release from [Releases](https://github.com/yourusername/CDR-Analyzer/releases).
+Download the latest release from [Releases](https://github.com/yourusername/CDR-Analyzer/releases)
+
 
 ## 🔹 Usage
 Run the executable:
